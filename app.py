@@ -193,9 +193,20 @@ STATE: Dict[str, Any] = {
     "captures": [],
     "grid_cols": 0,
     "grid_rows": 0,
+    "naming": "coords",   # "coords" | "seq"
+    "seq": 0,             # счётчик для режима "seq"
 }
-SCAN = {"running": False, "progress": 0, "total": 0, "message": ""}
 
+SCAN = {"running": False, "progress": 0, "total": 0, "message": ""}
+DEMO = {
+    "running": False,
+    "row": 0, "col": 0,          # текущая ячейка сетки
+    "cycle": 0,                   # номер прохода (цикл)
+    "tick": 0,                    # счётчик сработавших «затворов»
+    "phase": "idle",              # idle | moving | settling | shooting
+    "shot_at": 0.0,               # time.time() последней «съёмки»
+    "message": "",
+}
 
 def apply_adjust(frame: np.ndarray, brightness: int, contrast: int, saturation: int) -> np.ndarray:
     if brightness == 0 and contrast == 0 and saturation == 0:
@@ -214,6 +225,16 @@ def apply_adjust(frame: np.ndarray, brightness: int, contrast: int, saturation: 
         img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     return img
 
+def make_filename(row: int, col: int, tag: Optional[str] = None) -> str:
+    """Возвращает имя файла в зависимости от выбранного режима именования."""
+    if STATE.get("naming") == "seq":
+        name = f"{STATE['seq']:04d}.png"
+        STATE["seq"] += 1
+        return name
+    # режим "coords"
+    if tag is None:
+        return f"r{row:03d}_c{col:03d}.png"
+    return f"{tag}.png"
 
 def new_session() -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -223,6 +244,7 @@ def new_session() -> Path:
     STATE["captures"] = []
     STATE["grid_cols"] = 0
     STATE["grid_rows"] = 0
+    STATE["seq"] = 0
     return p
 
 
@@ -269,7 +291,7 @@ def run_scan(rows: int, cols: int, step_x: float, step_y: float,
                     continue
                 frame = apply_adjust(frame, STATE["brightness"],
                                      STATE["contrast"], STATE["saturation"])
-                fname = f"r{r:03d}_c{c:03d}.png"
+                fname = make_filename(r, c)
                 cv2.imwrite(str(session / fname), frame)
                 STATE["captures"].append({
                     "row": r, "col": c, "file": fname, "x": x, "y": y
@@ -292,10 +314,74 @@ def run_scan(rows: int, cols: int, step_x: float, step_y: float,
     finally:
         SCAN["running"] = False
 
+def run_demo(rows: int, cols: int, step_x: float, step_y: float,
+             feed: float, snake: bool, settle: float):
+    grbl: Optional[GRBLController] = STATE["grbl"]
+    if grbl is None:
+        DEMO.update(running=False, phase="idle", message="GRBL not connected")
+        return
+
+    DEMO.update(running=True, row=0, col=0, cycle=0, tick=0,
+                phase="idle", shot_at=0.0, message="Demo running")
+    STATE["grid_rows"] = rows
+    STATE["grid_cols"] = cols
+
+    try:
+        while DEMO["running"]:
+            DEMO["cycle"] += 1
+            # «домашняя» точка — берём текущую позицию как старт каждого прохода
+            try:
+                grbl.wait_idle(timeout=5)
+            except Exception:
+                pass
+            x0 = grbl.status.get("x", 0.0)
+            y0 = grbl.status.get("y", 0.0)
+
+            for r in range(rows):
+                if not DEMO["running"]:
+                    return
+                seq = list(range(cols))
+                if snake and r % 2 == 1:
+                    seq.reverse()
+                for c in seq:
+                    if not DEMO["running"]:
+                        return
+
+                    x = x0 + c * step_x
+                    y = y0 + r * step_y
+
+                    # --- едем ---
+                    DEMO.update(row=r, col=c, phase="moving")
+                    try:
+                        grbl.move_abs(x, y, feed)
+                        grbl.wait_idle(timeout=120)
+                    except Exception as e:
+                        DEMO["message"] = f"Move error: {e}"
+
+                    # --- стабилизация ---
+                    DEMO.update(phase="settling")
+                    # settle — ждём указанное время; шаг минимальный 0.05с
+                    t_end = time.time() + max(0.05, settle)
+                    while DEMO["running"] and time.time() < t_end:
+                        time.sleep(0.02)
+
+                    if not DEMO["running"]:
+                        return
+
+                    # --- «снимок»: одна короткая вспышка ---
+                    DEMO.update(phase="shooting", tick=DEMO["tick"] + 1,
+                                shot_at=time.time())
+                    # короткая пауза, чтобы UI успел отрисовать вспышку
+                    time.sleep(0.12)
+
+    finally:
+        DEMO.update(running=False, phase="idle", message="Demo stopped")
 
 # ======================= FastAPI =======================
 app = FastAPI(title="PCB Microscope Scanner")
-
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 class MoveIn(BaseModel):
     dx: float = 0.0
@@ -479,6 +565,21 @@ def api_adjust(a: AdjustIn):
             STATE[k] = int(max(-100, min(100, v)))
     return {k: STATE[k] for k in ("brightness", "contrast", "saturation")}
 
+class NamingIn(BaseModel):
+    naming: str  # "coords" | "seq"
+
+
+@app.get("/api/naming")
+def api_naming_get():
+    return {"naming": STATE.get("naming", "coords")}
+
+
+@app.post("/api/naming")
+def api_naming_set(n: NamingIn):
+    if n.naming not in ("coords", "seq"):
+        raise HTTPException(400, "naming must be 'coords' or 'seq'")
+    STATE["naming"] = n.naming
+    return {"ok": True, "naming": STATE["naming"]}
 
 @app.post("/api/capture")
 def api_capture():
@@ -494,7 +595,7 @@ def api_capture():
     idx = len(STATE["captures"])
     cols = max(1, STATE["grid_cols"] or 1)
     row, col = idx // cols, idx % cols
-    fname = f"manual_{idx:04d}.png"
+    fname = make_filename(row, col, tag=f"manual_{idx:04d}")
     cv2.imwrite(str(STATE["session_dir"] / fname), frame)
     STATE["captures"].append({"row": row, "col": col, "file": fname})
     return {"ok": True, "file": fname, "count": len(STATE["captures"])}
@@ -507,6 +608,8 @@ def api_captures():
         "cols": STATE["grid_cols"],
         "captures": STATE["captures"],
         "scan": SCAN,
+        "demo": DEMO,
+        "naming": STATE.get("naming", "coords"),
     }
 
 
@@ -540,6 +643,41 @@ def api_scan_stop():
     SCAN["running"] = False
     return {"ok": True}
 
+@app.post("/api/demo/start")
+def api_demo_start(s: ScanIn):
+    if DEMO["running"]:
+        raise HTTPException(400, "Demo already running")
+    if STATE["grbl"] is None:
+        raise HTTPException(400, "GRBL not connected")
+    if STATE["camera"] is None:
+        raise HTTPException(400, "Camera not connected")
+    t = threading.Thread(target=run_demo, kwargs=dict(
+        rows=s.rows, cols=s.cols, step_x=s.step_x, step_y=s.step_y,
+        feed=s.feed, snake=s.snake, settle=s.settle), daemon=True)
+    t.start()
+    return {"ok": True}
+
+
+@app.post("/api/demo/stop")
+def api_demo_stop():
+    DEMO["running"] = False
+    return {"ok": True}
+
+
+@app.get("/api/demo/state")
+def api_demo_state():
+    return {
+        "running": DEMO["running"],
+        "row": DEMO["row"],
+        "col": DEMO["col"],
+        "cycle": DEMO["cycle"],
+        "tick": DEMO["tick"],
+        "phase": DEMO["phase"],
+        "shot_at": DEMO["shot_at"],
+        "message": DEMO["message"],
+        "rows": STATE["grid_rows"],
+        "cols": STATE["grid_cols"],
+    }
 
 # ======================= UI =======================
 HTML_PAGE = r"""
@@ -547,32 +685,55 @@ HTML_PAGE = r"""
 <title>PCB Microscope Scanner</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;font:13px/1.4 system-ui,sans-serif;background:#0e0e10;color:#dcdcdc;display:flex;height:100vh;overflow:hidden}
-#left{width:340px;padding:10px;overflow-y:auto;background:#18181b;border-right:1px solid #2a2a2e}
+body{margin:0;font:13px/1.4 system-ui,sans-serif;background:#121212;color:#e6e6e6;display:flex;height:100vh;overflow:hidden}
+#left{width:340px;padding:10px;overflow-y:auto;background:#1E1E1E;border-right:1px solid #2a2a2e}
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 #view{flex:1;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden;position:relative}
 #view img{max-width:100%;max-height:100%;object-fit:contain}
-#bottom{height:42%;overflow:auto;background:#08080a;border-top:1px solid #2a2a2e;position:relative}
-h3{margin:14px 0 6px;font-size:12px;text-transform:uppercase;color:#8a8a92;letter-spacing:.5px}
+#view .flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .2s ease-out}
+#view .flash.on{opacity:.55;transition:opacity .04s ease-in}
+#bottom{height:42%;overflow:auto;background:#0b0b0b;border-top:1px solid #2a2a2e;position:relative}
+h3{margin:14px 0 6px;font-size:12px;text-transform:uppercase;color:#FFAF26;letter-spacing:.5px}
 .row{display:flex;gap:6px;margin-bottom:6px;align-items:center}
-.row label{width:60px;color:#8a8a92}
-input,select,button{background:#232327;color:#e0e0e0;border:1px solid #333;padding:5px 7px;border-radius:4px;font:inherit}
-input[type=range]{padding:0}
+.row label{width:60px;color:#9a9a9a}
+input,select,button{background:#232327;color:#e6e6e6;border:1px solid #333;padding:5px 7px;border-radius:4px;font:inherit}
+input[type=range]{padding:0;accent-color:#FFAF26}
 button{cursor:pointer;background:#2a2a30}
 button:hover{background:#3a3a44}
-button.primary{background:#2b6cb0;border-color:#2b6cb0}
-button.primary:hover{background:#3182ce}
+button.primary{background:#FFAF26;border-color:#FFAF26;color:#121212;font-weight:600}
+button.primary:hover{background:#ffc457}
 button.danger{background:#7a2222;border-color:#7a2222}
+button.demo{background:#3a2a00;border-color:#FFAF26;color:#FFAF26}
+button.demo:hover{background:#4a3600}
 .jog-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:4px 0}
 .jog-grid button{padding:8px 4px}
-.status{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#7fdb7f;background:#0c0c0e;padding:6px;border-radius:4px;border:1px solid #222}
+.status{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#FFAF26;background:#0c0c0e;padding:6px;border-radius:4px;border:1px solid #222}
 #grid-inner{display:grid;gap:0;line-height:0}
 #grid-inner img{width:100%;display:block}
-#scan-progress{color:#f6c344;font-size:12px;margin-top:4px}
+#grid-inner .cell{aspect-ratio:4/3;background:#111;position:relative;overflow:hidden}
+#grid-inner .cell.demo{outline:1px solid #FFAF26}
+/* Вспышка-«затвор» внутри ячейки: срабатывает один раз при смене .cell.demo на .flash */
+#grid-inner .cell.flash::after{
+  content:"";position:absolute;inset:0;background:#fff;opacity:0;
+  animation:cellflash .25s ease-out;
+}
+@keyframes cellflash{0%{opacity:.9}100%{opacity:0}}
+#scan-progress{color:#FFAF26;font-size:12px;margin-top:4px}
 .small{font-size:11px;color:#666}
+#logo{display:flex;align-items:center;gap:8px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid #2a2a2e}
+#logo .logo-img{width:32px;height:32px;flex:0 0 32px;object-fit:contain;display:block}
+#logo .name{font-weight:700;color:#FFAF26;letter-spacing:.5px}
+#logo .sub{font-size:10px;color:#8a8a92;text-transform:uppercase;letter-spacing:1px}
 </style></head><body>
 
 <div id="left">
+<div id="logo">
+  <img src="/static/logo.svg" alt="PCB Microscope" class="logo-img">
+  <div>
+    <div class="name">PCB Microscope</div>
+    <div class="sub">Scanner</div>
+  </div>
+</div>
   <h3>GRBL</h3>
   <div class="row">
     <select id="ports" style="flex:1"><option value="AUTO">AUTO</option></select>
@@ -611,6 +772,7 @@ button.danger{background:#7a2222;border-color:#7a2222}
   <div class="row"><button onclick="captureOne()" style="flex:1">📸 Capture</button></div>
 
   <h3>Auto Scan</h3>
+  
   <div class="row"><label>Rows</label><input id="rows" type="number" value="3" style="flex:1"></div>
   <div class="row"><label>Cols</label><input id="cols" type="number" value="5" style="flex:1"></div>
   <div class="row"><label>Step X</label><input id="sx" type="number" value="5" step="0.1" style="flex:1"></div>
@@ -621,9 +783,20 @@ button.danger{background:#7a2222;border-color:#7a2222}
     <button class="primary" onclick="startScan()" style="flex:1">▶ Start</button>
     <button class="danger" onclick="stopScan()">■</button>
   </div>
+  <div class="row">
+    <button class="demo" onclick="startDemo()" style="flex:1">▶ Demo</button>
+    <button class="danger" onclick="stopDemo()">■</button>
+  </div>
   <div id="scan-progress"></div>
 
   <h3>Captures</h3>
+  <div class="row">
+    <label style="width:auto">Naming</label>
+    <select id="naming" onchange="setNaming()" style="flex:1">
+      <option value="coords">Координаты (r000_c000)</option>
+      <option value="seq">Порядковый номер (0000)</option>
+    </select>
+  </div>
   <div class="row">
     <button onclick="refreshCaptures()" style="flex:1">Refresh</button>
     <button class="danger" onclick="clearCaptures()">Clear</button>
@@ -631,7 +804,7 @@ button.danger{background:#7a2222;border-color:#7a2222}
 </div>
 
 <div id="main">
-  <div id="view"><img id="live" src="/video_feed" alt=""></div>
+  <div id="view"><img id="live" src="/video_feed" alt=""><div class="flash" id="flash"></div></div>
   <div id="bottom"><div id="grid-inner"></div></div>
 </div>
 
@@ -702,9 +875,82 @@ async function startScan() {
     settle: parseFloat($("#settle").value),
   });
 }
+
 async function stopScan() { await jpost("/api/scan/stop"); }
 
 async function clearCaptures() { await jpost("/api/captures/clear"); refreshCaptures(); }
+
+async function loadNaming() {
+  try {
+    const r = await fetch("/api/naming").then(r=>r.json());
+    const sel = $("#naming");
+    if (sel && r && r.naming) sel.value = r.naming;
+  } catch(e) {}
+}
+
+async function setNaming() {
+  const naming = $("#naming").value;
+  await jpost("/api/naming", { naming });
+}
+
+let demoTimer = null;
+let lastShotAt = 0;     // последний обработанный shot_at
+let lastTick   = 0;     // последний обработанный tick
+
+async function startDemo() {
+  await jpost("/api/demo/start", {
+    rows:   parseInt($("#rows").value),
+    cols:   parseInt($("#cols").value),
+    step_x: parseFloat($("#sx").value),
+    step_y: parseFloat($("#sy").value),
+    feed:   parseFloat($("#feed").value),
+    snake:  $("#snake").checked,
+    settle: parseFloat($("#settle").value),
+  });
+  lastShotAt = 0;
+  lastTick = 0;
+  startDemoPolling();
+}
+
+async function stopDemo() {
+  await jpost("/api/demo/stop");
+  stopDemoPolling();
+}
+
+function triggerFlash() {
+  const flash = $("#flash");
+  flash.classList.remove("on");
+  // force reflow, чтобы анимация перезапустилась, даже если шла
+  void flash.offsetWidth;
+  flash.classList.add("on");
+  setTimeout(()=>flash.classList.remove("on"), 140);
+}
+
+function startDemoPolling() {
+  if (demoTimer) return;
+  demoTimer = setInterval(async () => {
+    try {
+      const d = await fetch("/api/demo/state").then(r=>r.json());
+      if (!d.running) {
+        stopDemoPolling();
+        refreshCaptures();
+        return;
+      }
+      // Реагируем ровно один раз на каждый новый «снимок»
+      if (d.tick !== lastTick) {
+        lastTick = d.tick;
+        lastShotAt = d.shot_at;
+        triggerFlash();
+      }
+    } catch(e){}
+  }, 120);
+}
+
+function stopDemoPolling() {
+  if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+  const flash = $("#flash");
+  flash.classList.remove("on");
+}
 
 async function refreshCaptures() {
   const data = await fetch("/api/captures").then(r=>r.json());
@@ -723,15 +969,28 @@ async function refreshCaptures() {
     const idx = c.row * cols + c.col;
     if (idx < cells.length) cells[idx] = c;
   }
-  inner.innerHTML = cells.map(c =>
-    c ? `<img src="/captures/${c.file}?t=${Date.now()}" alt="">`
-      : `<div style="aspect-ratio:4/3;background:#111"></div>`
-  ).join("");
 
-  if (data.scan) {
-    $("#scan-progress").textContent = data.scan.running
-      ? `⏳ ${data.scan.message} (${data.scan.progress}/${data.scan.total})`
-      : (data.scan.message || "");
+  const demo = data.demo || {running:false, row:0, col:0, tick:0};
+  const demoIdx = demo.running ? (demo.row * cols + demo.col) : -1;
+
+  inner.innerHTML = cells.map((c, i) => {
+    if (c) return `<img src="/captures/${c.file}?t=${Date.now()}" alt="">`;
+    if (i === demoIdx) {
+      const flashCls = (demo.tick && demo.tick === lastTick) ? " flash" : "";
+      return `<div class="cell demo${flashCls}"></div>`;
+    }
+    return `<div class="cell"></div>`;
+  }).join("");
+
+  const prog = $("#scan-progress");
+  if (data.scan && data.scan.running) {
+    prog.textContent = `⏳ ${data.scan.message} (${data.scan.progress}/${data.scan.total})`;
+  } else if (demo.running) {
+    prog.textContent = `🎬 DEMO  проход ${demo.cycle}  r${demo.row} c${demo.col}  (${demo.phase})`;
+  } else if (data.scan && data.scan.message) {
+    prog.textContent = data.scan.message;
+  } else {
+    prog.textContent = "";
   }
 }
 
@@ -751,6 +1010,7 @@ async function pollStatus() {
 setInterval(pollStatus, 700);
 setInterval(refreshCaptures, 1500);
 loadPorts();
+loadNaming();
 refreshCaptures();
 </script>
 </body></html>
