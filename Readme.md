@@ -10,14 +10,27 @@
 
 ## Установка
 
-```powershell
+```Windows powershell
 python -m pip install fastapi "uvicorn[standard]" opencv-python pyserial numpy python-multipart
+```
+```Linux
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv \
+    libopencv-dev python3-opencv v4l-utils
+sudo usermod -aG dialout $USER
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install fastapi "uvicorn[standard]" opencv-python pyserial numpy python-multipart
 ```
 
 ## Запуск
 
 ```powershell
 python -m uvicorn app:app --host 0.0.0.0 --port 8000 --log-level warning
+```
+```Linux
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 Затем открыть http://localhost:8000 в браузере
