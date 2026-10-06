@@ -21,6 +21,10 @@ CAM_WIDTH    = int(os.environ.get("CAM_WIDTH", "1920"))
 CAM_HEIGHT   = int(os.environ.get("CAM_HEIGHT", "1080"))
 CAPTURES_DIR = Path(os.environ.get("CAPTURES_DIR", "captures")).resolve()
 CAPTURES_DIR.mkdir(exist_ok=True)
+HOST         = os.environ.get("HOST", "0.0.0.0")
+PORT         = int(os.environ.get("PORT", "8000"))
+IS_WINDOWS   = (os.name == "nt")
+IS_LINUX     = (os.name == "posix")
 
 
 # ======================= GRBL =======================
@@ -34,13 +38,18 @@ class GRBLController:
         self.status = {"state": "Unknown", "x": 0.0, "y": 0.0, "z": 0.0}
         self._stop = False
         self._wake()
-        threading.Thread(target=self._read_loop, daemon=True).start()
-        threading.Thread(target=self._poll_loop, daemon=True).start()
+        self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._read_thread.start()
+        self._poll_thread.start()
 
     def _wake(self):
-        self.ser.write(b"\r\n\r\n")
-        time.sleep(1)
-        self.ser.reset_input_buffer()
+        try:
+            self.ser.write(b"\r\n\r\n")
+            time.sleep(1)
+            self.ser.reset_input_buffer()
+        except Exception as e:
+            print(f"[grbl] wake failed: {e}")
 
     def _read_loop(self):
         buf = ""
@@ -125,8 +134,10 @@ class GRBLController:
 
     def close(self):
         self._stop = True
-        try: self.ser.close()
-        except Exception: pass
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
 
 # ======================= Camera =======================
@@ -134,7 +145,11 @@ class Camera:
     def __init__(self, index: int = 0, w: int = 1920, h: int = 1080):
         self.cap = self._open(index)
         if self.cap is None or not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {index}")
+            raise RuntimeError(
+                f"Cannot open camera index {index}. "
+                f"На Linux проверьте /dev/video* и права (группа video). "
+                f"On Linux check /dev/video* and 'video' group membership."
+            )
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         for _ in range(5):
@@ -142,15 +157,20 @@ class Camera:
         self.lock = threading.Lock()
         self.frame: Optional[np.ndarray] = None
         self._stop = False
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     @staticmethod
-    def _open(index: int):
-        if os.name == "nt":
-            backends = [("MSMF", cv2.CAP_MSMF), ("DSHOW", cv2.CAP_DSHOW), ("ANY", cv2.CAP_ANY)]
-        else:
-            backends = [("V4L2", cv2.CAP_V4L2), ("ANY", cv2.CAP_ANY)]
-        for name, backend in backends:
+    def _backends():
+        if IS_WINDOWS:
+            return [("MSMF", cv2.CAP_MSMF), ("DSHOW", cv2.CAP_DSHOW), ("ANY", cv2.CAP_ANY)]
+        if IS_LINUX:
+            return [("V4L2", cv2.CAP_V4L2), ("GSTREAMER", getattr(cv2, "CAP_GSTREAMER", cv2.CAP_ANY)), ("ANY", cv2.CAP_ANY)]
+        return [("ANY", cv2.CAP_ANY)]
+
+    @classmethod
+    def _open(cls, index: int):
+        for name, backend in cls._backends():
             try:
                 cap = cv2.VideoCapture(index, backend)
                 if cap.isOpened():
@@ -165,8 +185,11 @@ class Camera:
 
     def _loop(self):
         while not self._stop:
-            ok, f = self.cap.read()
-            if ok:
+            try:
+                ok, f = self.cap.read()
+            except Exception:
+                ok, f = False, None
+            if ok and f is not None:
                 with self.lock:
                     self.frame = f
             else:
@@ -178,8 +201,10 @@ class Camera:
 
     def close(self):
         self._stop = True
-        try: self.cap.release()
-        except Exception: pass
+        try:
+            self.cap.release()
+        except Exception:
+            pass
 
 
 # ======================= State =======================
@@ -194,19 +219,21 @@ STATE: Dict[str, Any] = {
     "grid_cols": 0,
     "grid_rows": 0,
     "naming": "coords",   # "coords" | "seq"
-    "seq": 0,             # счётчик для режима "seq"
+    "seq": 0,
 }
 
-SCAN = {"running": False, "progress": 0, "total": 0, "message": ""}
+SCAN = {"running": False, "progress": 0, "total": 0, "message": "", "message_key": ""}
 DEMO = {
     "running": False,
-    "row": 0, "col": 0,          # текущая ячейка сетки
-    "cycle": 0,                   # номер прохода (цикл)
-    "tick": 0,                    # счётчик сработавших «затворов»
-    "phase": "idle",              # idle | moving | settling | shooting
-    "shot_at": 0.0,               # time.time() последней «съёмки»
+    "row": 0, "col": 0,
+    "cycle": 0,
+    "tick": 0,
+    "phase": "idle",
+    "shot_at": 0.0,
     "message": "",
+    "message_key": "",
 }
+
 
 def apply_adjust(frame: np.ndarray, brightness: int, contrast: int, saturation: int) -> np.ndarray:
     if brightness == 0 and contrast == 0 and saturation == 0:
@@ -225,16 +252,16 @@ def apply_adjust(frame: np.ndarray, brightness: int, contrast: int, saturation: 
         img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     return img
 
+
 def make_filename(row: int, col: int, tag: Optional[str] = None) -> str:
-    """Возвращает имя файла в зависимости от выбранного режима именования."""
     if STATE.get("naming") == "seq":
         name = f"{STATE['seq']:04d}.png"
         STATE["seq"] += 1
         return name
-    # режим "coords"
     if tag is None:
         return f"r{row:03d}_c{col:03d}.png"
     return f"{tag}.png"
+
 
 def new_session() -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -254,13 +281,14 @@ def run_scan(rows: int, cols: int, step_x: float, step_y: float,
     grbl: Optional[GRBLController] = STATE["grbl"]
     cam: Optional[Camera] = STATE["camera"]
     if grbl is None:
-        SCAN.update(running=False, message="GRBL not connected")
+        SCAN.update(running=False, message="GRBL not connected", message_key="grbl_not_connected")
         return
     if cam is None:
-        SCAN.update(running=False, message="Camera not connected")
+        SCAN.update(running=False, message="Camera not connected", message_key="cam_not_connected")
         return
 
-    SCAN.update(running=True, total=rows * cols, progress=0, message="Homing...")
+    SCAN.update(running=True, total=rows * cols, progress=0,
+                message="Homing...", message_key="homing")
     session = new_session()
     STATE["grid_rows"] = rows
     STATE["grid_cols"] = cols
@@ -298,6 +326,7 @@ def run_scan(rows: int, cols: int, step_x: float, step_y: float,
                 })
                 SCAN["progress"] += 1
                 SCAN["message"] = f"{SCAN['progress']}/{SCAN['total']}"
+                SCAN["message_key"] = "progress"
 
         with open(session / "meta.json", "w", encoding="utf-8") as f:
             json.dump({
@@ -309,27 +338,31 @@ def run_scan(rows: int, cols: int, step_x: float, step_y: float,
                 "captures": STATE["captures"],
             }, f, indent=2)
         SCAN["message"] = "Done"
+        SCAN["message_key"] = "done"
     except Exception as e:
         SCAN["message"] = f"Error: {e}"
+        SCAN["message_key"] = "error"
     finally:
         SCAN["running"] = False
+
 
 def run_demo(rows: int, cols: int, step_x: float, step_y: float,
              feed: float, snake: bool, settle: float):
     grbl: Optional[GRBLController] = STATE["grbl"]
     if grbl is None:
-        DEMO.update(running=False, phase="idle", message="GRBL not connected")
+        DEMO.update(running=False, phase="idle",
+                    message="GRBL not connected", message_key="grbl_not_connected")
         return
 
     DEMO.update(running=True, row=0, col=0, cycle=0, tick=0,
-                phase="idle", shot_at=0.0, message="Demo running")
+                phase="idle", shot_at=0.0,
+                message="Demo running", message_key="demo_running")
     STATE["grid_rows"] = rows
     STATE["grid_cols"] = cols
 
     try:
         while DEMO["running"]:
             DEMO["cycle"] += 1
-            # «домашняя» точка — берём текущую позицию как старт каждого прохода
             try:
                 grbl.wait_idle(timeout=5)
             except Exception:
@@ -350,17 +383,15 @@ def run_demo(rows: int, cols: int, step_x: float, step_y: float,
                     x = x0 + c * step_x
                     y = y0 + r * step_y
 
-                    # --- едем ---
                     DEMO.update(row=r, col=c, phase="moving")
                     try:
                         grbl.move_abs(x, y, feed)
                         grbl.wait_idle(timeout=120)
                     except Exception as e:
                         DEMO["message"] = f"Move error: {e}"
+                        DEMO["message_key"] = "move_error"
 
-                    # --- стабилизация ---
                     DEMO.update(phase="settling")
-                    # settle — ждём указанное время; шаг минимальный 0.05с
                     t_end = time.time() + max(0.05, settle)
                     while DEMO["running"] and time.time() < t_end:
                         time.sleep(0.02)
@@ -368,20 +399,35 @@ def run_demo(rows: int, cols: int, step_x: float, step_y: float,
                     if not DEMO["running"]:
                         return
 
-                    # --- «снимок»: одна короткая вспышка ---
                     DEMO.update(phase="shooting", tick=DEMO["tick"] + 1,
                                 shot_at=time.time())
-                    # короткая пауза, чтобы UI успел отрисовать вспышку
                     time.sleep(0.12)
 
     finally:
-        DEMO.update(running=False, phase="idle", message="Demo stopped")
+        DEMO.update(running=False, phase="idle",
+                    message="Demo stopped", message_key="demo_stopped")
+
 
 # ======================= FastAPI =======================
 app = FastAPI(title="PCB Microscope Scanner")
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
+
+# автосоздание логотипа, если его нет
+_logo_path = STATIC_DIR / "logo.svg"
+if not _logo_path.exists():
+    _logo_path.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<rect width="64" height="64" rx="10" fill="#121212"/>'
+        '<circle cx="32" cy="26" r="12" fill="none" stroke="#FFAF26" stroke-width="3"/>'
+        '<rect x="22" y="42" width="20" height="10" rx="2" fill="#FFAF26"/>'
+        '<circle cx="32" cy="26" r="4" fill="#FFAF26"/>'
+        '</svg>',
+        encoding="utf-8"
+    )
+
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 
 class MoveIn(BaseModel):
     dx: float = 0.0
@@ -405,6 +451,10 @@ class ScanIn(BaseModel):
     settle: float = 0.4
 
 
+class NamingIn(BaseModel):
+    naming: str  # "coords" | "seq"
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML_PAGE
@@ -422,8 +472,18 @@ def get_capture(name: str):
 
 @app.get("/api/ports")
 def api_ports():
-    return [{"device": p.device, "description": p.description}
-            for p in list_ports.comports()]
+    ports = []
+    for p in list_ports.comports():
+        ports.append({"device": p.device, "description": p.description})
+    # на Linux добавим «сырые» устройства, даже если pyserial их не увидел
+    if IS_LINUX:
+        import glob
+        known = {p["device"] for p in ports}
+        for pat in ("/dev/ttyUSB*", "/dev/ttyACM*"):
+            for dev in sorted(glob.glob(pat)):
+                if dev not in known:
+                    ports.append({"device": dev, "description": "raw device"})
+    return ports
 
 
 # ---------- GRBL ----------
@@ -438,16 +498,31 @@ def api_grbl_connect(payload: dict = Body(default={})):
         STATE["grbl"] = None
 
     if port == "AUTO":
-        cands = [p.device for p in list_ports.comports()
-                 if any(k in (p.description or "").lower()
-                        for k in ("ch340", "cp210", "usb", "serial", "uart"))]
+        cands = []
+        for p in list_ports.comports():
+            desc = (p.description or "").lower()
+            dev = p.device or ""
+            if any(k in desc for k in ("ch340", "cp210", "usb", "serial", "uart")):
+                cands.append(dev)
+            elif IS_LINUX and (dev.startswith("/dev/ttyUSB") or dev.startswith("/dev/ttyACM")):
+                cands.append(dev)
+        if not cands and IS_LINUX:
+            import glob
+            cands = sorted(glob.glob("/dev/ttyUSB*")) + sorted(glob.glob("/dev/ttyACM*"))
         if not cands:
-            raise HTTPException(400, "No serial ports found")
+            raise HTTPException(400, "No serial ports found. On Linux check /dev/ttyUSB* /dev/ttyACM* and dialout group.")
         port = cands[0]
 
     try:
         ctrl = GRBLController(port, GRBL_BAUD)
         STATE["grbl"] = ctrl
+    except PermissionError:
+        raise HTTPException(
+            500,
+            f"Permission denied on {port}. On Linux run: "
+            f"sudo usermod -aG dialout $USER  (then re-login)  "
+            f"or: sudo chmod 666 {port}"
+        )
     except Exception as e:
         raise HTTPException(500, f"Open {port} failed: {e}")
     return {"ok": True, "port": port}
@@ -565,9 +640,6 @@ def api_adjust(a: AdjustIn):
             STATE[k] = int(max(-100, min(100, v)))
     return {k: STATE[k] for k in ("brightness", "contrast", "saturation")}
 
-class NamingIn(BaseModel):
-    naming: str  # "coords" | "seq"
-
 
 @app.get("/api/naming")
 def api_naming_get():
@@ -580,6 +652,7 @@ def api_naming_set(n: NamingIn):
         raise HTTPException(400, "naming must be 'coords' or 'seq'")
     STATE["naming"] = n.naming
     return {"ok": True, "naming": STATE["naming"]}
+
 
 @app.post("/api/capture")
 def api_capture():
@@ -643,6 +716,7 @@ def api_scan_stop():
     SCAN["running"] = False
     return {"ok": True}
 
+
 @app.post("/api/demo/start")
 def api_demo_start(s: ScanIn):
     if DEMO["running"]:
@@ -675,9 +749,11 @@ def api_demo_state():
         "phase": DEMO["phase"],
         "shot_at": DEMO["shot_at"],
         "message": DEMO["message"],
+        "message_key": DEMO["message_key"],
         "rows": STATE["grid_rows"],
         "cols": STATE["grid_cols"],
     }
+
 
 # ======================= UI =======================
 HTML_PAGE = r"""
@@ -712,7 +788,6 @@ button.demo:hover{background:#4a3600}
 #grid-inner img{width:100%;display:block}
 #grid-inner .cell{aspect-ratio:4/3;background:#111;position:relative;overflow:hidden}
 #grid-inner .cell.demo{outline:1px solid #FFAF26}
-/* Вспышка-«затвор» внутри ячейки: срабатывает один раз при смене .cell.demo на .flash */
 #grid-inner .cell.flash::after{
   content:"";position:absolute;inset:0;background:#fff;opacity:0;
   animation:cellflash .25s ease-out;
@@ -724,6 +799,8 @@ button.demo:hover{background:#4a3600}
 #logo .logo-img{width:32px;height:32px;flex:0 0 32px;object-fit:contain;display:block}
 #logo .name{font-weight:700;color:#FFAF26;letter-spacing:.5px}
 #logo .sub{font-size:10px;color:#8a8a92;text-transform:uppercase;letter-spacing:1px}
+#lang-toggle{margin-left:auto;background:#232327;border:1px solid #FFAF26;color:#FFAF26;font-weight:600;padding:4px 8px;border-radius:4px;cursor:pointer}
+#lang-toggle:hover{background:#3a2a00}
 </style></head><body>
 
 <div id="left">
@@ -731,28 +808,30 @@ button.demo:hover{background:#4a3600}
   <img src="/static/logo.svg" alt="PCB Microscope" class="logo-img">
   <div>
     <div class="name">PCB Microscope</div>
-    <div class="sub">Scanner</div>
+    <div class="sub" data-i18n="app_sub">Scanner</div>
   </div>
+  <button id="lang-toggle" onclick="toggleLang()" title="RU / EN">RU</button>
 </div>
-  <h3>GRBL</h3>
+
+  <h3 data-i18n="grbl">GRBL</h3>
   <div class="row">
     <select id="ports" style="flex:1"><option value="AUTO">AUTO</option></select>
     <button onclick="loadPorts()">↻</button>
   </div>
   <div class="row">
-    <button class="primary" onclick="grblConnect()" style="flex:1">Connect</button>
-    <button onclick="grblDisconnect()">Disconnect</button>
+    <button class="primary" onclick="grblConnect()" style="flex:1" data-i18n="connect">Connect</button>
+    <button onclick="grblDisconnect()" data-i18n="disconnect">Disconnect</button>
   </div>
   <div class="row">
-    <button onclick="grblHome()">$H Home</button>
-    <button onclick="grblUnlock()">$X Unlock</button>
+    <button onclick="grblHome()">$H <span data-i18n="home">Home</span></button>
+    <button onclick="grblUnlock()">$X <span data-i18n="unlock">Unlock</span></button>
   </div>
-  <div class="status" id="grbl-status">disconnected</div>
+  <div class="status" id="grbl-status" data-i18n="disconnected">disconnected</div>
 
-  <h3>Jog</h3>
-  <div class="row"><label>Step mm</label>
+  <h3 data-i18n="jog">Jog</h3>
+  <div class="row"><label data-i18n="step_mm">Step mm</label>
     <input id="step" type="number" value="1" step="0.1" style="flex:1"></div>
-  <div class="row"><label>Feed</label>
+  <div class="row"><label data-i18n="feed">Feed</label>
     <input id="feed" type="number" value="3000" style="flex:1"></div>
   <div class="jog-grid">
     <button onclick="jog(-1,1)">↖</button><button onclick="jog(0,1)">↑</button><button onclick="jog(1,1)">↗</button>
@@ -760,46 +839,45 @@ button.demo:hover{background:#4a3600}
     <button onclick="jog(-1,-1)">↙</button><button onclick="jog(0,-1)">↓</button><button onclick="jog(1,-1)">↘</button>
   </div>
 
-  <h3>Camera</h3>
+  <h3 data-i18n="camera">Camera</h3>
   <div class="row">
     <input id="camidx" type="number" value="0" style="width:60px">
-    <button class="primary" onclick="camConnect()" style="flex:1">Connect camera</button>
+    <button class="primary" onclick="camConnect()" style="flex:1" data-i18n="cam_connect">Connect camera</button>
     <button onclick="camDisconnect()">×</button>
   </div>
-  <div class="row"><label>Bright</label><input id="brightness" type="range" min="-100" max="100" value="0" style="flex:1" oninput="setAdjust()"></div>
-  <div class="row"><label>Contrast</label><input id="contrast" type="range" min="-100" max="100" value="0" style="flex:1" oninput="setAdjust()"></div>
-  <div class="row"><label>Satur</label><input id="saturation" type="range" min="-100" max="100" value="0" style="flex:1" oninput="setAdjust()"></div>
-  <div class="row"><button onclick="captureOne()" style="flex:1">📸 Capture</button></div>
+  <div class="row"><label data-i18n="bright">Bright</label><input id="brightness" type="range" min="-100" max="100" value="0" style="flex:1" oninput="setAdjust()"></div>
+  <div class="row"><label data-i18n="contrast">Contrast</label><input id="contrast" type="range" min="-100" max="100" value="0" style="flex:1" oninput="setAdjust()"></div>
+  <div class="row"><label data-i18n="satur">Satur</label><input id="saturation" type="range" min="-100" max="100" value="0" style="flex:1" oninput="setAdjust()"></div>
+  <div class="row"><button onclick="captureOne()" style="flex:1">📸 <span data-i18n="capture">Capture</span></button></div>
 
-  <h3>Auto Scan</h3>
-  
-  <div class="row"><label>Rows</label><input id="rows" type="number" value="3" style="flex:1"></div>
-  <div class="row"><label>Cols</label><input id="cols" type="number" value="5" style="flex:1"></div>
-  <div class="row"><label>Step X</label><input id="sx" type="number" value="5" step="0.1" style="flex:1"></div>
-  <div class="row"><label>Step Y</label><input id="sy" type="number" value="4" step="0.1" style="flex:1"></div>
-  <div class="row"><label>Settle s</label><input id="settle" type="number" value="0.4" step="0.1" style="flex:1"></div>
-  <div class="row"><input id="snake" type="checkbox" checked> <label style="width:auto">Snake pattern</label></div>
+  <h3 data-i18n="auto_scan">Auto Scan</h3>
+  <div class="row"><label data-i18n="rows">Rows</label><input id="rows" type="number" value="3" style="flex:1"></div>
+  <div class="row"><label data-i18n="cols">Cols</label><input id="cols" type="number" value="5" style="flex:1"></div>
+  <div class="row"><label data-i18n="step_x">Step X</label><input id="sx" type="number" value="5" step="0.1" style="flex:1"></div>
+  <div class="row"><label data-i18n="step_y">Step Y</label><input id="sy" type="number" value="4" step="0.1" style="flex:1"></div>
+  <div class="row"><label data-i18n="settle_s">Settle s</label><input id="settle" type="number" value="0.4" step="0.1" style="flex:1"></div>
+  <div class="row"><input id="snake" type="checkbox" checked> <label style="width:auto" data-i18n="snake">Snake pattern</label></div>
   <div class="row">
-    <button class="primary" onclick="startScan()" style="flex:1">▶ Start</button>
+    <button class="primary" onclick="startScan()" style="flex:1">▶ <span data-i18n="start">Start</span></button>
     <button class="danger" onclick="stopScan()">■</button>
   </div>
   <div class="row">
-    <button class="demo" onclick="startDemo()" style="flex:1">▶ Demo</button>
+    <button class="demo" onclick="startDemo()" style="flex:1">▶ <span data-i18n="demo">Demo</span></button>
     <button class="danger" onclick="stopDemo()">■</button>
   </div>
   <div id="scan-progress"></div>
 
-  <h3>Captures</h3>
+  <h3 data-i18n="captures">Captures</h3>
   <div class="row">
-    <label style="width:auto">Naming</label>
+    <label style="width:auto" data-i18n="naming">Naming</label>
     <select id="naming" onchange="setNaming()" style="flex:1">
-      <option value="coords">Координаты (r000_c000)</option>
-      <option value="seq">Порядковый номер (0000)</option>
+      <option value="coords" data-i18n="naming_coords">Координаты (r000_c000)</option>
+      <option value="seq" data-i18n="naming_seq">Порядковый номер (0000)</option>
     </select>
   </div>
   <div class="row">
-    <button onclick="refreshCaptures()" style="flex:1">Refresh</button>
-    <button class="danger" onclick="clearCaptures()">Clear</button>
+    <button onclick="refreshCaptures()" style="flex:1" data-i18n="refresh">Refresh</button>
+    <button class="danger" onclick="clearCaptures()" data-i18n="clear">Clear</button>
   </div>
 </div>
 
@@ -811,6 +889,132 @@ button.demo:hover{background:#4a3600}
 <script>
 const $ = s => document.querySelector(s);
 
+/* ---------- i18n ---------- */
+const I18N = {
+  ru: {
+    app_sub: "Сканер",
+    grbl: "GRBL",
+    connect: "Подключить",
+    disconnect: "Отключить",
+    home: "Домой",
+    unlock: "Разблокировать",
+    disconnected: "не подключено",
+    jog: "Ручное управление",
+    step_mm: "Шаг мм",
+    feed: "Подача",
+    camera: "Камера",
+    cam_connect: "Подключить камеру",
+    bright: "Яркость",
+    contrast: "Контраст",
+    satur: "Насыщ.",
+    capture: "Снимок",
+    auto_scan: "Автосканирование",
+    rows: "Строк",
+    cols: "Столбцов",
+    step_x: "Шаг X",
+    step_y: "Шаг Y",
+    settle_s: "Пауза с",
+    snake: "Змейкой",
+    start: "Старт",
+    demo: "Демо",
+    captures: "Снимки",
+    naming: "Имена",
+    naming_coords: "Координаты (r000_c000)",
+    naming_seq: "Порядковый номер (0000)",
+    refresh: "Обновить",
+    clear: "Очистить",
+    homing: "Хомирование...",
+    done: "Готово",
+    grbl_not_connected: "GRBL не подключён",
+    cam_not_connected: "Камера не подключена",
+    demo_running: "Демо запущено",
+    demo_stopped: "Демо остановлено",
+    progress: "Прогресс",
+    error: "Ошибка",
+    move_error: "Ошибка движения",
+    scan_running: "Сканирование...",
+    demo_phase_moving: "движение",
+    demo_phase_settling: "стабилизация",
+    demo_phase_shooting: "снимок",
+    demo_phase_idle: "ожидание",
+    demo_pass: "проход",
+  },
+  en: {
+    app_sub: "Scanner",
+    grbl: "GRBL",
+    connect: "Connect",
+    disconnect: "Disconnect",
+    home: "Home",
+    unlock: "Unlock",
+    disconnected: "disconnected",
+    jog: "Jog",
+    step_mm: "Step mm",
+    feed: "Feed",
+    camera: "Camera",
+    cam_connect: "Connect camera",
+    bright: "Bright",
+    contrast: "Contrast",
+    satur: "Satur",
+    capture: "Capture",
+    auto_scan: "Auto Scan",
+    rows: "Rows",
+    cols: "Cols",
+    step_x: "Step X",
+    step_y: "Step Y",
+    settle_s: "Settle s",
+    snake: "Snake pattern",
+    start: "Start",
+    demo: "Demo",
+    captures: "Captures",
+    naming: "Naming",
+    naming_coords: "Coordinates (r000_c000)",
+    naming_seq: "Sequential (0000)",
+    refresh: "Refresh",
+    clear: "Clear",
+    homing: "Homing...",
+    done: "Done",
+    grbl_not_connected: "GRBL not connected",
+    cam_not_connected: "Camera not connected",
+    demo_running: "Demo running",
+    demo_stopped: "Demo stopped",
+    progress: "Progress",
+    error: "Error",
+    move_error: "Move error",
+    scan_running: "Scanning...",
+    demo_phase_moving: "moving",
+    demo_phase_settling: "settling",
+    demo_phase_shooting: "shooting",
+    demo_phase_idle: "idle",
+    demo_pass: "pass",
+  }
+};
+
+let LANG = localStorage.getItem("lang") || "ru";
+
+function t(key) {
+  const dict = I18N[LANG] || I18N.ru;
+  return dict[key] || key;
+}
+
+function applyI18n() {
+  document.querySelectorAll("[data-i18n]").forEach(el => {
+    const key = el.getAttribute("data-i18n");
+    const val = t(key);
+    if (val) el.textContent = val;
+  });
+  const btn = $("#lang-toggle");
+  if (btn) btn.textContent = (LANG === "ru") ? "EN" : "RU";
+  document.documentElement.lang = LANG;
+}
+
+function toggleLang() {
+  LANG = (LANG === "ru") ? "en" : "ru";
+  localStorage.setItem("lang", LANG);
+  applyI18n();
+  refreshCaptures();
+}
+
+/* ---------- helpers ---------- */
 async function jpost(url, body) {
   const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(body||{})});
@@ -832,6 +1036,7 @@ async function loadPorts() {
   if (cur && [...sel.options].some(o=>o.value===cur)) sel.value = cur;
 }
 
+/* ---------- GRBL ---------- */
 async function grblConnect() {
   const port = $("#ports").value;
   const r = await jpost("/api/grbl/connect", {port});
@@ -847,6 +1052,7 @@ async function jog(sx, sy) {
   await jpost("/api/grbl/move", {dx: sx*step, dy: sy*step, feed});
 }
 
+/* ---------- Camera ---------- */
 async function camConnect() {
   await jpost("/api/camera/connect", {index: parseInt($("#camidx").value)});
 }
@@ -864,6 +1070,7 @@ function setAdjust() {
 
 async function captureOne() { await jpost("/api/capture"); refreshCaptures(); }
 
+/* ---------- Scan ---------- */
 async function startScan() {
   await jpost("/api/scan/start", {
     rows:   parseInt($("#rows").value),
@@ -875,11 +1082,10 @@ async function startScan() {
     settle: parseFloat($("#settle").value),
   });
 }
-
 async function stopScan() { await jpost("/api/scan/stop"); }
-
 async function clearCaptures() { await jpost("/api/captures/clear"); refreshCaptures(); }
 
+/* ---------- Naming ---------- */
 async function loadNaming() {
   try {
     const r = await fetch("/api/naming").then(r=>r.json());
@@ -887,15 +1093,15 @@ async function loadNaming() {
     if (sel && r && r.naming) sel.value = r.naming;
   } catch(e) {}
 }
-
 async function setNaming() {
   const naming = $("#naming").value;
   await jpost("/api/naming", { naming });
 }
 
+/* ---------- Demo ---------- */
 let demoTimer = null;
-let lastShotAt = 0;     // последний обработанный shot_at
-let lastTick   = 0;     // последний обработанный tick
+let lastShotAt = 0;
+let lastTick   = 0;
 
 async function startDemo() {
   await jpost("/api/demo/start", {
@@ -911,7 +1117,6 @@ async function startDemo() {
   lastTick = 0;
   startDemoPolling();
 }
-
 async function stopDemo() {
   await jpost("/api/demo/stop");
   stopDemoPolling();
@@ -920,7 +1125,6 @@ async function stopDemo() {
 function triggerFlash() {
   const flash = $("#flash");
   flash.classList.remove("on");
-  // force reflow, чтобы анимация перезапустилась, даже если шла
   void flash.offsetWidth;
   flash.classList.add("on");
   setTimeout(()=>flash.classList.remove("on"), 140);
@@ -936,7 +1140,6 @@ function startDemoPolling() {
         refreshCaptures();
         return;
       }
-      // Реагируем ровно один раз на каждый новый «снимок»
       if (d.tick !== lastTick) {
         lastTick = d.tick;
         lastShotAt = d.shot_at;
@@ -950,6 +1153,13 @@ function stopDemoPolling() {
   if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
   const flash = $("#flash");
   flash.classList.remove("on");
+}
+
+/* ---------- Captures ---------- */
+function phaseLabel(phase) {
+  const key = "demo_phase_" + phase;
+  const v = t(key);
+  return v === key ? phase : v;
 }
 
 async function refreshCaptures() {
@@ -984,16 +1194,21 @@ async function refreshCaptures() {
 
   const prog = $("#scan-progress");
   if (data.scan && data.scan.running) {
-    prog.textContent = `⏳ ${data.scan.message} (${data.scan.progress}/${data.scan.total})`;
+    prog.textContent = `⏳ ${t("scan_running")} ${data.scan.progress}/${data.scan.total}`;
   } else if (demo.running) {
-    prog.textContent = `🎬 DEMO  проход ${demo.cycle}  r${demo.row} c${demo.col}  (${demo.phase})`;
+    prog.textContent = `🎬 ${t("demo")}  ${t("demo_pass")} ${demo.cycle}  r${demo.row} c${demo.col}  (${phaseLabel(demo.phase)})`;
   } else if (data.scan && data.scan.message) {
-    prog.textContent = data.scan.message;
+    if (data.scan.message_key === "done") prog.textContent = t("done");
+    else if (data.scan.message_key === "homing") prog.textContent = t("homing");
+    else if (data.scan.message_key === "grbl_not_connected") prog.textContent = t("grbl_not_connected");
+    else if (data.scan.message_key === "cam_not_connected") prog.textContent = t("cam_not_connected");
+    else prog.textContent = data.scan.message;
   } else {
     prog.textContent = "";
   }
 }
 
+/* ---------- Status ---------- */
 async function pollStatus() {
   try {
     const s = await fetch("/api/grbl/status").then(r=>r.json());
@@ -1002,16 +1217,23 @@ async function pollStatus() {
       const y = (s.y ?? 0).toFixed(3);
       $("#grbl-status").textContent = `${s.state}  X:${x}  Y:${y}`;
     } else {
-      $("#grbl-status").textContent = "disconnected";
+      $("#grbl-status").textContent = t("disconnected");
     }
   } catch(e) {}
 }
 
 setInterval(pollStatus, 700);
 setInterval(refreshCaptures, 1500);
+applyI18n();
 loadPorts();
 loadNaming();
 refreshCaptures();
 </script>
 </body></html>
 """
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print(f"PCB Microscope Scanner → http://{HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
